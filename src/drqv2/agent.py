@@ -258,7 +258,7 @@ class DrQV2Agent(StochasticAgent):
         logs["critic_target_q"] = target_Q.mean().item()
         logs["critic_q1"] = Q1.mean().item()
         logs["critic_q2"] = Q2.mean().item()
-        logs["critic_loss"] = critic_loss.item() / 2
+        logs["critic_loss"] = critic_loss.item()
 
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)

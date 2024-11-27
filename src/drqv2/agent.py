@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import drqv2.utils as utils
-from segdac.agents.stochastic_agent import StochasticAgent
-from segdac.agents.sampling_strategy import SamplingStrategy
+from segdac.agents.agent import Agent
+from drqv2.action_sampling_strategy import DrqV2ActionSamplingStrategy
 from tensordict import TensorDict
 
 
@@ -39,14 +39,14 @@ class RandomShiftsAug(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, obs_shape):
+    def __init__(self, in_channels):
         super().__init__()
 
-        assert len(obs_shape) == 3
+        assert in_channels % 3 == 0
         self.repr_dim = 32 * 35 * 35
 
         self.convnet = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 32, 3, stride=2),
+            nn.Conv2d(in_channels, 32, 3, stride=2),
             nn.ReLU(),
             nn.Conv2d(32, 32, 3, stride=1),
             nn.ReLU(),
@@ -59,7 +59,7 @@ class Encoder(nn.Module):
         self.apply(utils.weight_init)
 
     def forward(self, obs):
-        obs = obs / 255.0 - 0.5
+        obs = obs - 0.5
         h = self.convnet(obs)
         h = h.view(h.shape[0], -1)
         return h
@@ -129,10 +129,10 @@ class Critic(nn.Module):
         return q1, q2
 
 
-class DrQV2Agent(StochasticAgent):
+class DrQV2Agent(Agent):
     def __init__(
         self,
-        obs_shape,
+        in_channels,
         action_dim,
         device,
         gamma,
@@ -145,7 +145,7 @@ class DrQV2Agent(StochasticAgent):
         stddev_clip,
         env_action_scaler,
     ):
-        super().__init__(env_action_scaler=env_action_scaler)
+        super().__init__(env_action_scaler=env_action_scaler, action_sampling_strategy=None)
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
@@ -154,10 +154,15 @@ class DrQV2Agent(StochasticAgent):
         self.env_step = 0
 
         # models
-        self.encoder = Encoder(obs_shape).to(device)
+        self.encoder = Encoder(in_channels).to(device)
         self.actor = Actor(
             self.encoder.repr_dim, action_dim, feature_dim, hidden_dim
         ).to(device)
+        self.action_sampling_strategy = DrqV2ActionSamplingStrategy(
+            actor=self.actor,
+            encoder=self.encoder,
+            stddev_schedule=self.stddev_schedule
+        )
 
         self.critic = Critic(
             self.encoder.repr_dim, action_dim, feature_dim, hidden_dim
@@ -178,19 +183,6 @@ class DrQV2Agent(StochasticAgent):
 
         self.train()
         self.critic_target.train()
-
-    def get_action(self, observation: torch.Tensor) -> torch.Tensor:
-        obs = self.encoder(observation)
-        stddev = utils.schedule(self.stddev_schedule, self.env_step)
-        dist = self.actor(obs, stddev)
-
-        if self.sampling_strategy == SamplingStrategy.RANDOM:
-            action = dist.sample(clip=None)
-            self.env_step += 1
-        else:
-            action = dist.mean
-
-        return action
 
     def train(self, training=True):
         self.training = training
@@ -253,11 +245,15 @@ class DrQV2Agent(StochasticAgent):
             target_Q = reward + not_done * (discount * target_V)
 
         Q1, Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        critic_loss_1 = F.mse_loss(Q1, target_Q)
+        critic_loss_2 = F.mse_loss(Q2, target_Q)
+        critic_loss = critic_loss_1 + critic_loss_2
 
         logs["critic_target_q"] = target_Q.mean().item()
         logs["critic_q1"] = Q1.mean().item()
         logs["critic_q2"] = Q2.mean().item()
+        logs["critic_loss_1"] = critic_loss_1.item()
+        logs["critic_loss_2"] = critic_loss_2.item()
         logs["critic_loss"] = critic_loss.item()
 
         # optimize encoder and critic
